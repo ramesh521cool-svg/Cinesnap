@@ -1,0 +1,44 @@
+{
+  "expo": {
+    "name": "CineSnap",
+    "slug": "cinesnap",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0F0F14",
+    "splash": {
+      "backgroundColor": "#0F0F14"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.cinesnap.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "CineSnap needs camera access to identify content playing on your screen.",
+        "NSPhotoLibraryUsageDescription": "CineSnap may save scan results to your photo library."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0F0F14"
+      },
+      "package": "com.cinesnap.app",
+      "permissions": ["android.permission.CAMERA"]
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-camera",
+        { "cameraPermission": "CineSnap needs your camera to identify what's playing on screen." }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "scheme": "cinesnap",
+    "extra": {
+      "eas": { "projectId": "your-eas-project-id" }
+    }
+  }
+}

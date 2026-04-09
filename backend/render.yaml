@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: cinesnap-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false        # You'll paste this in the Render dashboard
+      - key: TMDB_API_KEY
+        sync: false
+      - key: OMDB_API_KEY
+        sync: false
+      - key: GOOGLE_VISION_API_KEY
+        sync: false
+      - key: SERPAPI_KEY
+        sync: false
+      - key: ENVIRONMENT
+        value: production
