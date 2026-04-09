@@ -9,4 +9,4 @@
 // ─────────────────────────────────────────────────────────────────
 // Same origin — frontend and API are served from the same Railway URL.
 // Empty string means "use current host" (works locally AND in production).
-window.CINESNAP_API = '';
+window.CINESNAP_API = window.location.origin;
