@@ -1,37 +1,14 @@
 """
-Vision Agent — Identifies content from camera frames using:
-  1. Google Cloud Vision API (OCR + label detection)
-  2. Perceptual hashing (frame stability)
-  3. Text cleanup heuristics to produce a title candidate
+Vision Agent — Identifies content from camera frames using Claude Vision.
+Sends the best frame to Claude and asks it to identify the movie/show on screen.
 """
 import base64
 import os
 import re
-import httpx
 from dataclasses import dataclass
 from typing import Optional
 
-
-VISION_API_URL = "https://vision.googleapis.com/v1/images:annotate"
-
-# Common noise words to strip from OCR text before title search
-NOISE_WORDS = {
-    "netflix", "hbo", "hulu", "disney", "apple", "amazon", "prime",
-    "max", "paramount", "peacock", "streaming", "original", "series",
-    "season", "episode", "part", "volume", "chapter", "now streaming",
-    "cc", "hd", "4k", "uhd", "dolby", "atmos", "dts",
-}
-
-STREAMING_LOGOS = {
-    "netflix": "Netflix",
-    "hbo": "HBO",
-    "disney": "Disney+",
-    "hulu": "Hulu",
-    "amazon": "Amazon Prime",
-    "apple": "Apple TV+",
-    "paramount": "Paramount+",
-    "peacock": "Peacock",
-}
+import anthropic
 
 
 @dataclass
@@ -47,154 +24,112 @@ class VisionResult:
 
 async def analyze_frames(frames_b64: list[str]) -> VisionResult:
     """
-    Send frames to Google Vision API and extract structured content hints.
-    Uses the first 2 frames to reduce cost and latency.
+    Send the best frame to Claude Vision and extract the movie/show title.
     """
-    api_key = os.environ["GOOGLE_VISION_API_KEY"]
-
-    # Limit to 2 frames — the best quality ones
-    selected = _pick_best_frames(frames_b64, n=2)
-
-    requests = []
-    for frame_b64 in selected:
-        requests.append({
-            "image": {"content": frame_b64},
-            "features": [
-                {"type": "TEXT_DETECTION", "maxResults": 50},
-                {"type": "LABEL_DETECTION", "maxResults": 20},
-                {"type": "LOGO_DETECTION", "maxResults": 5},
-            ]
-        })
-
-    async with httpx.AsyncClient(timeout=8.0, verify=False) as client:
-        resp = await client.post(
-            VISION_API_URL,
-            params={"key": api_key},
-            json={"requests": requests}
-        )
-
-    if resp.status_code != 200:
+    if not frames_b64:
         return _fallback_result()
 
-    responses = resp.json().get("responses", [])
+    # Pick the largest frame (most detail)
+    best_frame = max(frames_b64, key=len)
 
-    all_text: list[str] = []
-    all_labels: list[str] = []
-    all_logos: list[str] = []
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-    for r in responses:
-        if r.get("textAnnotations"):
-            full_text = r["textAnnotations"][0].get("description", "")
-            all_text.append(full_text)
-        if r.get("labelAnnotations"):
-            for lbl in r["labelAnnotations"]:
-                if lbl.get("score", 0) > 0.70:
-                    all_labels.append(lbl["description"].lower())
-        if r.get("logoAnnotations"):
-            for logo in r["logoAnnotations"]:
-                all_logos.append(logo.get("description", "").lower())
+    prompt = """Look at this image of a TV or screen. Identify what movie or TV show is playing.
 
-    combined_text = "\n".join(all_text)
-    title_candidate, year_candidate = _extract_title_and_year(combined_text)
-    platform_hint = _detect_platform(all_logos, combined_text)
-    confidence = _compute_confidence(title_candidate, all_labels, combined_text)
+Respond in this exact format:
+TITLE: <title here>
+YEAR: <year if visible, otherwise UNKNOWN>
+PLATFORM: <streaming service if visible (Netflix, HBO, Disney+, etc.), otherwise UNKNOWN>
+CONFIDENCE: <HIGH, MEDIUM, or LOW>
+EXPLANATION: <one sentence about what visual clues you used>
+
+If you cannot identify any movie or show, respond with:
+TITLE: UNIDENTIFIED
+YEAR: UNKNOWN
+PLATFORM: UNKNOWN
+CONFIDENCE: LOW
+EXPLANATION: Could not identify content from this frame."""
+
+    try:
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": best_frame,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ],
+                }
+            ],
+        )
+
+        response_text = message.content[0].text
+        return _parse_claude_response(response_text)
+
+    except Exception as e:
+        return _fallback_result()
+
+
+def _parse_claude_response(text: str) -> VisionResult:
+    """Parse Claude's structured response into a VisionResult."""
+
+    def extract(field: str) -> str:
+        match = re.search(rf'^{field}:\s*(.+)$', text, re.MULTILINE | re.IGNORECASE)
+        return match.group(1).strip() if match else ""
+
+    title = extract("TITLE")
+    year_str = extract("YEAR")
+    platform = extract("PLATFORM")
+    confidence_str = extract("CONFIDENCE").upper()
+    explanation = extract("EXPLANATION")
+
+    # Map confidence string to float
+    confidence_map = {"HIGH": 0.90, "MEDIUM": 0.65, "LOW": 0.20}
+    confidence = confidence_map.get(confidence_str, 0.20)
+
+    # If Claude says unidentified
+    if not title or title.upper() == "UNIDENTIFIED":
+        return VisionResult(
+            title_candidate="",
+            year_candidate=None,
+            detected_text=explanation,
+            platform_hint=None,
+            scene_labels=[],
+            confidence=0.0,
+            is_stable_frame=True,
+        )
+
+    # Parse year
+    year = None
+    if year_str and year_str.upper() != "UNKNOWN":
+        year_match = re.search(r'\b(19[5-9]\d|20[0-2]\d)\b', year_str)
+        if year_match:
+            year = int(year_match.group())
+
+    # Clean up platform
+    platform_hint = None if (not platform or platform.upper() == "UNKNOWN") else platform
 
     return VisionResult(
-        title_candidate=title_candidate,
-        year_candidate=year_candidate,
-        detected_text=combined_text[:500],  # truncate for logging
+        title_candidate=title,
+        year_candidate=year,
+        detected_text=explanation,
         platform_hint=platform_hint,
-        scene_labels=all_labels[:10],
+        scene_labels=["movie", "film"],
         confidence=confidence,
-        is_stable_frame=len(selected) > 0,
+        is_stable_frame=True,
     )
-
-
-def _pick_best_frames(frames: list[str], n: int) -> list[str]:
-    """
-    Select the n sharpest frames using estimated JPEG size as a proxy
-    for visual information density. (Real impl would use Laplacian variance.)
-    """
-    if len(frames) <= n:
-        return frames
-    # Longer base64 → more detail (rough heuristic)
-    sorted_frames = sorted(frames, key=len, reverse=True)
-    return sorted_frames[:n]
-
-
-def _extract_title_and_year(text: str) -> tuple[str, Optional[int]]:
-    """
-    Extract the most likely title string and year from raw OCR text.
-    Strategy: find the longest non-noise line that looks like a title.
-    """
-    if not text.strip():
-        return "", None
-
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
-
-    # Detect year pattern
-    year_match = re.search(r'\b(19[5-9]\d|20[0-2]\d)\b', text)
-    year = int(year_match.group()) if year_match else None
-
-    # Score each line as a potential title
-    candidates = []
-    for line in lines:
-        line_lower = line.lower()
-
-        # Skip lines that are mostly noise words
-        words = set(line_lower.split())
-        noise_overlap = len(words & NOISE_WORDS) / max(len(words), 1)
-        if noise_overlap > 0.5:
-            continue
-
-        # Skip very short or very long lines
-        if len(line) < 3 or len(line) > 80:
-            continue
-
-        # Skip lines that look like timestamps or episode markers
-        if re.match(r'^\d{1,2}:\d{2}', line) or re.match(r'^S\d+E\d+', line, re.I):
-            continue
-
-        # Score: prefer title-cased multi-word phrases
-        score = 0
-        score += len(line.split())               # more words = likely title
-        score += 2 if line.istitle() else 0       # title case bonus
-        score -= noise_overlap * 5               # penalize noise
-        candidates.append((score, line))
-
-    if not candidates:
-        return "", year
-
-    candidates.sort(reverse=True)
-    best_title = candidates[0][1]
-
-    # Strip noise words from beginning/end
-    clean_words = [w for w in best_title.split() if w.lower() not in NOISE_WORDS]
-    clean_title = " ".join(clean_words).strip()
-
-    return clean_title, year
-
-
-def _detect_platform(logos: list[str], text: str) -> Optional[str]:
-    text_lower = text.lower()
-    for key, name in STREAMING_LOGOS.items():
-        if key in logos or key in text_lower:
-            return name
-    return None
-
-
-def _compute_confidence(title: str, labels: list[str], text: str) -> float:
-    score = 0.0
-    if title and len(title) > 3:
-        score += 0.5
-    if len(title.split()) >= 2:
-        score += 0.15
-    movie_labels = {"film", "movie", "cinema", "actor", "actress", "performance"}
-    if movie_labels & set(labels):
-        score += 0.2
-    if len(text) > 50:
-        score += 0.15
-    return min(round(score, 2), 1.0)
 
 
 def _fallback_result() -> VisionResult:
